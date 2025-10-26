@@ -236,7 +236,85 @@ Each strategy generates its own:
 
 ## 4. Technical Architecture
 
-### 4.1 System Layers
+### 4.1 Backend Server Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Client (Frontend/API)                       │
+│                   Next.js / Mobile App / CLI                    │
+└────────────────┬────────────────────────────────────────────────┘
+                 │ HTTPS/WSS
+                 ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                    API Gateway / Load Balancer                  │
+│                  (ALB, Nginx, or Cloud Provider)                │
+└────────────────┬────────────────────────────────────────────────┘
+                 │
+                 ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                  Backend Server (Node.js/Fastify)               │
+│  ┌───────────────────────────────────────────────────────────┐ │
+│  │  REST API Layer                                           │ │
+│  │  ├─ POST   /api/strategies (create via Builder Agent)    │ │
+│  │  ├─ GET    /api/strategies (list all)                    │ │
+│  │  ├─ GET    /api/strategies/:id (details)                 │ │
+│  │  ├─ PATCH  /api/strategies/:id (modify)                  │ │
+│  │  ├─ DELETE /api/strategies/:id (remove)                  │ │
+│  │  ├─ POST   /api/strategies/:id/activate                  │ │
+│  │  ├─ GET    /api/analysis/:strategyId (results)           │ │
+│  │  └─ GET    /health (health check)                        │ │
+│  └───────────────────────────────────────────────────────────┘ │
+│  ┌───────────────────────────────────────────────────────────┐ │
+│  │  WebSocket Layer                                          │ │
+│  │  ├─ Real-time strategy status updates                    │ │
+│  │  ├─ Live analysis results streaming                      │ │
+│  │  └─ Builder Agent conversation (Q&A)                     │ │
+│  └───────────────────────────────────────────────────────────┘ │
+└────────────────┬────────────────────────────────────────────────┘
+                 │
+    ┌────────────┼────────────┐
+    │            │            │
+    ↓            ↓            ↓
+┌────────┐  ┌─────────┐  ┌────────────┐
+│PostgreSQL  │ Redis   │  │ Job Queue  │
+│+TimeScale│  │ Cache   │  │ (BullMQ)   │
+└────────┘  └─────────┘  └──────┬─────┘
+                                 │
+                                 ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                    Strategy Execution Workers                   │
+│  (Containerized - one per strategy or pooled)                  │
+│                                                                 │
+│  ┌───────────────────────────────────────────────────────────┐ │
+│  │  Layer 1: Strategy Builder Agent (Meta-Agent)            │ │
+│  │  ├─ Receives user natural language input via API         │ │
+│  │  ├─ Generates complete strategy packages:                │ │
+│  │  │  ├─ Custom sub-agents (specialized prompts)           │ │
+│  │  │  ├─ Custom tools (data fetchers, calculators)         │ │
+│  │  │  ├─ Orchestration code (TypeScript)                   │ │
+│  │  │  └─ Configuration files                               │ │
+│  │  └─ Writes to /strategies/[strategy-name]/               │ │
+│  └───────────────────────────────────────────────────────────┘ │
+│                             ↓                                   │
+│  ┌───────────────────────────────────────────────────────────┐ │
+│  │  Layer 2: Strategy Orchestrators (Per-Strategy)          │ │
+│  │  ├─ Load generated TypeScript code                       │ │
+│  │  ├─ Spawn strategy-specific sub-agents (parallel)        │ │
+│  │  ├─ Coordinate data gathering                            │ │
+│  │  └─ Synthesize analysis with custom logic                │ │
+│  └───────────────────────────────────────────────────────────┘ │
+│                             ↓                                   │
+│  ┌───────────────────────────────────────────────────────────┐ │
+│  │  Layer 3: Scheduler                                       │ │
+│  │  ├─ Manages intervals per strategy (node-cron)           │ │
+│  │  ├─ Pushes jobs to BullMQ queue                          │ │
+│  │  ├─ Distributed locking via Redis                        │ │
+│  │  └─ Resource limits and throttling                       │ │
+│  └───────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 4.2 System Layers (Agent Architecture)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -274,7 +352,25 @@ Each strategy generates its own:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 Claude Agent SDK Integration
+### 4.3 Container Deployment Model
+
+**Option A: Per-Strategy Containers** (Recommended for MVP)
+- Each active strategy runs in its own Docker container
+- Complete isolation (security, resource limits)
+- Easy horizontal scaling
+- Higher overhead but maximum safety
+
+**Option B: Pooled Workers** (For scale optimization)
+- Worker pool executes strategies from queue
+- Share container resources
+- Lower overhead, higher throughput
+- Require careful isolation between strategies
+
+**Hybrid Approach** (Production)
+- High-frequency strategies (1m, 5m) → pooled workers
+- Long-running/resource-intensive strategies → dedicated containers
+
+### 4.4 Claude Agent SDK Integration
 
 **Strategy Builder Agent**
 ```typescript
@@ -351,31 +447,100 @@ function synthesizeSignal(whale, rsi) {
 }
 ```
 
-### 4.3 Key SDK Features Leveraged
+### 4.5 Key SDK Features Leveraged
 
 1. **Sub-Agent System**: Each strategy spawns custom sub-agents in parallel
 2. **Prompt Caching**: Cache strategy prompts and context (reduces costs 50%+)
-3. **Code Generation**: Strategy Builder generates TypeScript/Python code
+3. **Code Generation**: Strategy Builder generates TypeScript code
 4. **MCP Integration**: Connect to market data APIs, databases, blockchain explorers
 5. **Custom Tools**: Generated per-strategy (calculators, data fetchers, validators)
 6. **File System Tools**: Read/write strategy packages and analysis outputs
 
-### 4.4 Technology Stack
-- **Runtime**: Node.js/TypeScript
-- **SDK**: Claude Agent SDK (TypeScript)
-- **Code Generation**: TypeScript compiler API for validation
-- **Data Sources**:
-  - Market Data: Binance, Coinbase, Kraken APIs (REST/WebSocket)
-  - News/Sentiment: NewsAPI, Reddit API, Twitter/X API
-  - On-Chain: Blockchain.com, Etherscan, Dune Analytics
-  - Alternative Data: Glassnode, CoinGlass, LunarCrush
-- **Storage**:
-  - Strategy Packages: `/strategies/[name]/` (generated code + config)
+### 4.6 Technology Stack
+
+**Primary Language: TypeScript**
+- Chosen for production backend deployment
+- 44% faster request/sec vs Python
+- Better concurrency for I/O-heavy workloads (API calls, WebSockets)
+- Non-blocking I/O perfect for parallel strategy execution
+- Shared types across frontend/backend
+- Lower memory footprint for containerized deployment
+
+#### Backend Server
+- **Runtime**: Node.js 20+ LTS
+- **Framework**: Fastify (high-performance) or Express
+- **API**: RESTful + WebSocket for real-time updates
+- **SDK**: `@anthropic-ai/claude-agent-sdk` (TypeScript)
+- **Code Generation**: TypeScript Compiler API for validation
+- **Process Management**: PM2 or Docker containers
+
+#### Frontend (Future)
+- **Framework**: Next.js 15+ (React)
+- **UI**: shadcn/ui + Tailwind CSS
+- **State**: Zustand or React Query
+- **Charts**: Lightweight Charts (TradingView), Recharts
+- **Real-time**: Socket.io client
+
+#### Data Sources
+- **Market Data**: Binance, Coinbase, Kraken APIs (REST/WebSocket)
+- **News/Sentiment**: NewsAPI, Reddit API, Twitter/X API
+- **On-Chain**: Blockchain.com, Etherscan, Dune Analytics
+- **Alternative Data**: Glassnode, CoinGlass, LunarCrush
+
+#### Storage & Caching
+- **Database**: PostgreSQL 16+ with TimescaleDB extension
+  - Strategy metadata and configuration
+  - Historical analysis results (time-series)
+  - User accounts and permissions
+- **Cache**: Redis 7+
+  - Prompt caching for Claude SDK
+  - Rate limiting (per-API, per-user)
+  - Session management
+  - Real-time data buffering
+- **File Storage**:
+  - Strategy Packages: `/strategies/[name]/` (generated TypeScript code)
   - Analysis Output: `/analysis/[name]/[timestamp].md`
-  - Historical Data: PostgreSQL with TimescaleDB extension
-  - Cache: Redis for prompt caching and rate limiting
-- **Scheduling**: node-cron with distributed locking (for multi-instance)
-- **Monitoring**: Prometheus metrics, Winston logging
+  - S3-compatible storage for backups (optional)
+
+#### Scheduling & Orchestration
+- **Scheduler**: node-cron with Redis-based distributed locking
+- **Queue**: BullMQ (Redis-backed job queue)
+  - Strategy execution queue
+  - Retry logic for failed analyses
+  - Priority scheduling
+- **Containerization**: Docker for strategy isolation
+
+#### Monitoring & Observability
+- **Metrics**: Prometheus + Grafana
+  - API latency, throughput
+  - Strategy execution times
+  - Claude API usage and costs
+  - Error rates
+- **Logging**: Winston (structured JSON logs)
+  - Separate logs per strategy
+  - Centralized logging (CloudWatch, Datadog, or self-hosted)
+- **Tracing**: OpenTelemetry (optional)
+- **Health Checks**: `/health` endpoint with dependency checks
+
+#### Deployment Architecture
+- **Containers**: Docker + Docker Compose (local/staging)
+- **Cloud Options**:
+  - **AWS**: ECS Fargate + RDS + ElastiCache + ALB
+  - **Railway/Render**: Simplified deployment (early stage)
+  - **Fly.io**: Global edge deployment
+- **CI/CD**: GitHub Actions
+  - Automated testing on PRs
+  - Deploy to staging on merge to `main`
+  - Manual promotion to production
+- **Infrastructure as Code**: Terraform (optional for AWS)
+
+#### Security
+- **API Keys**: Environment variables + AWS Secrets Manager / HashiCorp Vault
+- **Authentication**: JWT tokens (frontend → backend)
+- **Authorization**: RBAC for multi-user support
+- **HTTPS**: TLS 1.3 via Let's Encrypt or AWS ACM
+- **Rate Limiting**: Redis-based per-user/IP limits
+- **Input Validation**: Zod schemas for all API inputs
 
 ## 5. Generated Strategy Package Structure
 
